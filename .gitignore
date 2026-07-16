@@ -1,0 +1,10 @@
+# Compiled binaries
+/bin/
+
+# Go build/test artifacts
+*.test
+*.out
+
+# Local secret stores and exchange blobs (never commit these)
+*.wsec
+*.wsx
