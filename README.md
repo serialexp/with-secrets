@@ -53,6 +53,7 @@ ws -g list              # list global names only (no touch)
 ws scopes               # list all scope names (no touch)
 ws rm   AWS_SECRET      # remove a secret from the current scope
 ws -g rm GITHUB_TOKEN   # remove a global secret
+ws get  AWS_SECRET | pbcopy   # print one value to stdout (touch; alias: show)
 ws request              # mint a one-time key to receive secrets from a coworker
 ws send --to TOKEN      # encrypt this repo's secrets to a coworker's token
 ws receive blob.wsx     # decrypt a received blob into your own store
@@ -72,6 +73,19 @@ there (a global name shadowed by a scoped one of the same name is omitted, since
 the scoped value wins). The index is authenticated alongside the header, so it
 can't be silently altered without failing the next decrypt.
 
+### Revealing a value
+
+`ws get NAME` decrypts a single secret (passphrase + touch, scoped lookup with
+global fallback like `run`) and writes the **raw value to stdout with no trailing
+newline**, so it pipes cleanly: `ws get AWS_SECRET | pbcopy`. Use `-g` to read a
+global directly.
+
+This is the only command that surfaces plaintext, and `ws` never protected the
+value from a holder of both factors anyway (`ws run -- printenv NAME` would do
+it). What `get` adds is hygiene: it **refuses to print to a terminal** unless you
+pass `-f`/`--force`, so a stray `ws get NAME` doesn't dump a secret into your
+scrollback, `ps`, or a shared session recording. Pipe it, or force it knowingly.
+
 ### Scopes
 
 Secrets are either **global** or **scoped to a project**. A project's scope is
@@ -87,15 +101,45 @@ that `.secrets`, so the very next `with-secrets run` already knows to inject it.
 
 `-g` targets global for `set`, `rm`, and `list`.
 
+#### Inheriting a parent scope
+
+Resolution is normally flat — the nearest `.secrets` and then global. In a
+monorepo where most secrets are common but a few are app-specific, a child
+manifest can **explicitly** opt into a parent's scope with a `# @extends <ref>`
+directive. `<ref>` points at the directory holding the parent `.secrets`,
+resolved relative to the child manifest's own directory:
+
+```
+mleap/.secrets                     # @scope mleap        + common ENV mappings
+mleap/apps/service-core/.secrets   # @scope service-core
+                                   # @extends ../..      + unique mappings
+```
+
+`ws run`/`ws get`/`ws list` inside `service-core` then see the **union** of both
+manifests' entries, resolving each value most-specific-first:
+`service-core` scope → `mleap` scope → global. A child entry shadows a parent
+one of the same name. Chains can be several levels deep (each link adds its own
+`@extends`); cycles and missing parents are errors.
+
+Inheritance is deliberately explicit — a stray ancestor `.secrets` never injects
+its secrets on its own. It's read-only, too: `set`/`rm` always target the
+nearest scope, so you populate a common secret by running `ws set` from the
+parent directory.
+
 ### Importing from `.env`
 
 `ws import [DIR]` migrates existing plaintext `.env` files into the store:
 
 1. Recursively finds `.env` / `.env.*` files under `DIR` (default CWD), skipping
-   `node_modules`, `.git`, `vendor`, template files (`*.example`, `*.sample`, …),
-   and its own `.bak` backups.
+   noise directories (VCS dirs, `node_modules`, `vendor`, `.pnpm-store`,
+   framework/build output like `.next`/`.turbo`/`.cache`, and `.claude`
+   worktrees), template files (`*.example`, `*.sample`, `*.template`, `*.dist`),
+   and its own `.bak` backups. Pass `--all` to disable every auto-ignore and scan
+   the tree verbatim. A scan progress line shows the current directory.
 2. If the results span several files/directories it warns first — they'll all land
-   in one scope, so you may prefer running `ws import` inside each project.
+   in one scope, so you may prefer running `ws import` inside each project. It also
+   flags any name that carries **conflicting values** across files (values shown
+   masked), since those can't coexist in one scope.
 3. Shows an interactive checklist of every variable (secret-looking ones
    pre-checked). Toggle with space, `a` for all, Enter to confirm, `q` to cancel.
 4. Imports the selected values into the current scope (creating a `.secrets` if
@@ -205,15 +249,37 @@ It names secrets, never values, so it's safe to commit.
 ```
 # .secrets
 # @scope acme-api                       # scope name (defaults to the file's dir)
+# @extends ../..                        # optional: inherit a parent scope's entries
 AWS_SECRET_ACCESS_KEY=aws/prod/secret   # ENV_VAR=store-key
 DATABASE_URL                            # shorthand: env var == store key
 ```
 
 `ws run` walks up for the nearest `.secrets`, reads its scope, and resolves each
-entry against that scope with global fallback.
+entry against that scope with global fallback. With `@extends` it follows the
+chain of parent manifests too, injecting the union of their entries and
+resolving most-specific-first (see [Inheriting a parent scope](#inheriting-a-parent-scope)).
 
 Store location: `$WITH_SECRETS_STORE`, else
 `$XDG_DATA_HOME/with-secrets/store.wsec` (default `~/.local/share/...`), mode 0600.
+
+## Install
+
+Prebuilt binaries are published to GitHub Releases for **macOS arm64 (Apple
+Silicon)**. The install script downloads the latest release, verifies its
+checksum, and (asking first) installs the `libfido2` runtime dependency via
+Homebrew:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/serialexp/with-secrets/main/install.sh | bash
+```
+
+Overrides: `WS_VERSION` (a release tag, default `latest`), `WS_INSTALL_DIR`
+(default `~/.local/bin`), `WS_ASSUME_YES=1` (install deps without prompting),
+`WS_SKIP_DEPS=1` (leave Homebrew/libfido2 alone). The binary **dynamically
+links** libfido2, so it must be present at runtime — the script handles that on
+a fresh machine.
+
+Other platforms: build from source (below).
 
 ## Build
 
@@ -224,3 +290,14 @@ to the audited libfido2 directly — no third-party FIDO binding.
 go test ./...
 go build -o bin/ws ./cmd/ws     # or: go install ./cmd/ws
 ```
+
+Releases are automated with [just-release](https://github.com/serialexp/just-release)
+and driven by conventional commits:
+
+- `.github/workflows/release.yml` runs on every push to `main` and opens/updates
+  a **release PR** that bumps the version and updates `CHANGELOG.md`.
+- Merging that PR lands a `release: X.Y.Z` commit, which triggers
+  `.github/workflows/publish.yml`: it builds the binary on a native Apple Silicon
+  runner (libfido2 from Homebrew), uploads it as a workflow artifact, then runs
+  just-release to create the `vX.Y.Z` GitHub Release and attach the binary plus
+  its `.sha256`. `ws version` prints the version baked in at build time.

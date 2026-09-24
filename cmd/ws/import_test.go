@@ -82,19 +82,22 @@ func TestDiscoverEnvFiles(t *testing.T) {
 	}
 	mk(".env", "A=1\n")
 	mk(".env.local", "B=2\n")
-	mk(".env.example", "A=\n")            // template: skipped
-	mk(".env.bak", "OLD=x\n")             // our own backup: skipped
-	mk("app/.env", "C=3\n")               // nested: found
-	mk("node_modules/pkg/.env", "D=4\n")  // skipped dir
-	mk("notenv.txt", "E=5\n")             // not a .env
+	mk(".env.example", "A=\n")           // template: skipped
+	mk(".env.bak", "OLD=x\n")            // our own backup: skipped
+	mk("app/.env", "C=3\n")              // nested: found
+	mk("node_modules/pkg/.env", "D=4\n") // skipped dir
+	mk(".pnpm-store/x/.env", "F=6\n")    // skipped dir
+	mk(".next/standalone/.env", "G=7\n") // skipped dir
+	mk("notenv.txt", "E=5\n")            // not a .env
 
-	got, err := discoverEnvFiles(root)
+	var entered []string
+	got, err := discoverEnvFiles(root, false, func(dir string) { entered = append(entered, dir) })
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := map[string]bool{
-		filepath.Join(root, ".env"):       true,
-		filepath.Join(root, ".env.local"): true,
+		filepath.Join(root, ".env"):        true,
+		filepath.Join(root, ".env.local"):  true,
 		filepath.Join(root, "app", ".env"): true,
 	}
 	if len(got) != len(want) {
@@ -104,6 +107,119 @@ func TestDiscoverEnvFiles(t *testing.T) {
 		if !want[p] {
 			t.Errorf("unexpected file discovered: %s", p)
 		}
+	}
+
+	// onEnter fires for the root and the descended app dir, but never for a
+	// skipped dir like node_modules.
+	seenApp, seenNodeMods := false, false
+	for _, d := range entered {
+		if d == filepath.Join(root, "app") {
+			seenApp = true
+		}
+		if d == filepath.Join(root, "node_modules") {
+			seenNodeMods = true
+		}
+	}
+	if !seenApp {
+		t.Errorf("onEnter should have reported the app dir; got %v", entered)
+	}
+	if seenNodeMods {
+		t.Errorf("onEnter should not report skipped node_modules; got %v", entered)
+	}
+
+	// --all disables every auto-ignore: templates, backups, and skipped dirs
+	// all come through.
+	all, err := discoverEnvFiles(root, true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	allWant := []string{
+		filepath.Join(root, ".env"),
+		filepath.Join(root, ".env.local"),
+		filepath.Join(root, ".env.example"),
+		filepath.Join(root, ".env.bak"),
+		filepath.Join(root, "app", ".env"),
+		filepath.Join(root, "node_modules", "pkg", ".env"),
+		filepath.Join(root, ".pnpm-store", "x", ".env"),
+		filepath.Join(root, ".next", "standalone", ".env"),
+	}
+	allGot := map[string]bool{}
+	for _, p := range all {
+		allGot[p] = true
+	}
+	for _, w := range allWant {
+		if !allGot[w] {
+			t.Errorf("--all should have found %s; got %v", w, all)
+		}
+	}
+}
+
+func TestParseImportArgs(t *testing.T) {
+	cases := []struct {
+		args    []string
+		wantDir string
+		wantAll bool
+		wantErr bool
+	}{
+		{nil, ".", false, false},
+		{[]string{"sub"}, "sub", false, false},
+		{[]string{"--all"}, ".", true, false},
+		{[]string{"sub", "--all"}, "sub", true, false},
+		{[]string{"--all", "sub"}, "sub", true, false},
+		{[]string{"a", "b"}, "", false, true}, // two dirs
+	}
+	for _, c := range cases {
+		dir, all, err := parseImportArgs(c.args)
+		if (err != nil) != c.wantErr {
+			t.Errorf("parseImportArgs(%v) err = %v, wantErr %v", c.args, err, c.wantErr)
+			continue
+		}
+		if err != nil {
+			continue
+		}
+		if dir != c.wantDir || all != c.wantAll {
+			t.Errorf("parseImportArgs(%v) = (%q,%v), want (%q,%v)", c.args, dir, all, c.wantDir, c.wantAll)
+		}
+	}
+}
+
+func TestKeyCollisions(t *testing.T) {
+	vars := []envVar{
+		{key: "SAME", value: "x", file: "a"},
+		{key: "SAME", value: "x", file: "b"}, // same value across files: not a collision
+		{key: "DB_URL", value: "prod", file: "a"},
+		{key: "DB_URL", value: "dev", file: "b"},
+		{key: "DB_URL", value: "dev", file: "c"}, // two distinct values (prod / dev)
+		{key: "SOLO", value: "only", file: "a"},  // single occurrence: not a collision
+	}
+	got := keyCollisions(vars)
+	if len(got) != 1 {
+		t.Fatalf("got %d collisions, want 1: %+v", len(got), got)
+	}
+	c := got[0]
+	if c.key != "DB_URL" {
+		t.Fatalf("collision key = %q, want DB_URL", c.key)
+	}
+	if len(c.byValue) != 2 {
+		t.Fatalf("want 2 distinct values, got %+v", c.byValue)
+	}
+	// First-seen order: prod (file a) then dev (files b, c).
+	if c.byValue[0].value != "prod" || len(c.byValue[0].files) != 1 {
+		t.Errorf("first value = %+v, want prod in 1 file", c.byValue[0])
+	}
+	if c.byValue[1].value != "dev" || len(c.byValue[1].files) != 2 {
+		t.Errorf("second value = %+v, want dev in 2 files", c.byValue[1])
+	}
+}
+
+func TestKeyCollisionsNoneWhenConsistent(t *testing.T) {
+	vars := []envVar{
+		{key: "A", value: "1", file: "x"},
+		{key: "A", value: "1", file: "y"},
+		{key: "B", value: "2", file: "x"},
+	}
+	if got := keyCollisions(vars); len(got) != 0 {
+		t.Fatalf("expected no collisions, got %+v", got)
 	}
 }
 
@@ -138,18 +254,5 @@ func TestStripFromEnvFiles(t *testing.T) {
 	}
 	if string(bak) != original {
 		t.Errorf("backup should hold the original verbatim, got %q", bak)
-	}
-}
-
-func TestValuePreview(t *testing.T) {
-	if valuePreview("") != "(empty)" {
-		t.Error("empty preview")
-	}
-	long := valuePreview(string(make([]byte, 0)) + "0123456789012345678901234567890123456789")
-	if []rune(long)[len([]rune(long))-1] != '…' {
-		t.Errorf("long value should be truncated with ellipsis: %q", long)
-	}
-	if valuePreview("line1\nline2") != "line1⏎line2" {
-		t.Error("newlines should be shown as ⏎")
 	}
 }

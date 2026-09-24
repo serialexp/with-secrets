@@ -1,0 +1,38 @@
+name: Release
+
+# Opens/updates a release PR from conventional commits using just-release.
+# Merging that PR lands a `release: X.Y.Z` commit on main, which triggers
+# publish.yml to build the binary and cut the GitHub Release.
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    # Skip release commits (squash merge) and merges of a release branch —
+    # those are handled by publish.yml.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (!startsWith(github.event.head_commit.message, 'release:') &&
+       !(startsWith(github.event.head_commit.message, 'Merge') && contains(github.event.head_commit.message, 'release/')))
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # full history so just-release can analyze commits
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 'lts/*'
+
+      - run: npx just-release
+        env:
+          CI: 1
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

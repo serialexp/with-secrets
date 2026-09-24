@@ -6,8 +6,6 @@
   offer to drop the manifest entry too.
 - **`prune` command.** No way to clean up orphan scopes (a `.secrets` deleted
   from disk leaves its bucket in the store). Add `ws prune`.
-- **PATH install.** Decide on `~/.local/bin` symlink vs `go install ./cmd/ws` vs
-  a brew formula so `ws` is on PATH.
 - **Import `.bak` cleanup.** `ws import` leaves `.env.bak` files (plaintext) as a
   safety net. Consider a `--shred-backups` flag or a follow-up prompt to remove
   them once the store is verified.

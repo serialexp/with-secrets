@@ -43,10 +43,10 @@ import (
 	"io"
 	"sort"
 
+	"crypto/sha256"
 	"golang.org/x/crypto/argon2"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/hkdf"
-	"crypto/sha256"
 )
 
 const (
@@ -156,7 +156,17 @@ func (s *Store) Set(scope, name, value string) {
 
 // Resolve looks up name in scope, then falls back to global.
 func (s *Store) Resolve(scope, name string) (string, bool) {
-	if scope != "" {
+	return s.ResolveChain([]string{scope}, name)
+}
+
+// ResolveChain looks up name across the given scopes in order (most specific
+// first), then falls back to global. The first hit wins. Empty scope names are
+// skipped, so a single "" scope resolves against global alone.
+func (s *Store) ResolveChain(scopes []string, name string) (string, bool) {
+	for _, scope := range scopes {
+		if scope == "" {
+			continue
+		}
 		if m, ok := s.Scopes[scope]; ok {
 			if v, ok := m[name]; ok {
 				return v, true

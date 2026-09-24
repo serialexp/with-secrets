@@ -156,6 +156,40 @@ func TestResolveFallbackAndMiss(t *testing.T) {
 	}
 }
 
+func TestResolveChain(t *testing.T) {
+	s := NewStore()
+	s.SetGlobal("SHARED", "global-val")
+	s.SetGlobal("ONLY_GLOBAL", "g")
+	s.Set("parent", "SHARED", "parent-val")
+	s.Set("parent", "FROM_PARENT", "p")
+	s.Set("kid", "SHARED", "kid-val")
+
+	// Most specific wins: kid > parent > global.
+	if v, ok := s.ResolveChain([]string{"kid", "parent"}, "SHARED"); !ok || v != "kid-val" {
+		t.Errorf("SHARED = %q,%v; want kid-val", v, ok)
+	}
+	// Falls through to the parent scope when the nearest lacks it.
+	if v, ok := s.ResolveChain([]string{"kid", "parent"}, "FROM_PARENT"); !ok || v != "p" {
+		t.Errorf("FROM_PARENT = %q,%v; want p", v, ok)
+	}
+	// Falls through the whole chain to global.
+	if v, ok := s.ResolveChain([]string{"kid", "parent"}, "ONLY_GLOBAL"); !ok || v != "g" {
+		t.Errorf("ONLY_GLOBAL = %q,%v; want g", v, ok)
+	}
+	// Total miss.
+	if _, ok := s.ResolveChain([]string{"kid", "parent"}, "NOPE"); ok {
+		t.Error("expected miss for unknown key")
+	}
+	// Empty scopes are skipped; resolves against global only.
+	if v, ok := s.ResolveChain([]string{""}, "SHARED"); !ok || v != "global-val" {
+		t.Errorf("empty-scope SHARED = %q,%v; want global-val", v, ok)
+	}
+	// A parent-only scope order does not see kid's value.
+	if v, ok := s.ResolveChain([]string{"parent"}, "SHARED"); !ok || v != "parent-val" {
+		t.Errorf("parent-only SHARED = %q,%v; want parent-val", v, ok)
+	}
+}
+
 func TestRemovePrunesEmptyScope(t *testing.T) {
 	s := NewStore()
 	s.Set("solo", "ONLY", "x")

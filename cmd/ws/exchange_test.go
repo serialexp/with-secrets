@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,15 +16,26 @@ import (
 func TestPreviewSecret(t *testing.T) {
 	cases := map[string]string{
 		"":                     "(empty)",
-		"ab":                   "(short)",
-		"abcd":                 "(short)",
-		"abcde":                "abc…e",
-		"supersecretvalue1234": "sup…4",
+		"ab":                   "ab",      // too short to mask: shown in full
+		"abcd":                 "abcd",    // (a 6-or-fewer secret is weak anyway)
+		"abcde":                "abcde",   //
+		"abcdef":               "abcdef",  // len 6: still full
+		"abcdefg":              "abc…efg", // len 7: first 3 + last 3, one rune hidden
+		"supersecretvalue1234": "sup…234",
+		"a\ncdefghij":          "a⏎c…hij", // newline shown as ⏎, never a raw newline
 	}
 	for in, want := range cases {
 		if got := previewSecret(in); got != want {
 			t.Errorf("previewSecret(%q) = %q, want %q", in, got, want)
 		}
+	}
+	// A masked value must never leak more than the six edge runes, nor a raw
+	// newline that would break the checklist row.
+	if got := previewSecret("supersecretvalue1234"); strings.Contains(got, "secret") {
+		t.Errorf("preview leaked the middle: %q", got)
+	}
+	if got := previewSecret("multi\nline\nsecret\nvalue"); strings.ContainsRune(got, '\n') {
+		t.Errorf("preview contained a raw newline: %q", got)
 	}
 }
 

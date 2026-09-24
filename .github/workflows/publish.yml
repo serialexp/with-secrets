@@ -1,0 +1,90 @@
+name: Publish
+
+# Runs when a `release: X.Y.Z` commit lands on main (the merged release PR).
+# `build-macos` builds the binary on a native Apple Silicon runner (cgo needs
+# libfido2 at build time) and uploads it as a workflow artifact. `publish` then
+# runs just-release, which creates the GitHub Release and attaches this run's
+# artifacts as assets.
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read # just-release reads this run's artifacts to attach them
+
+jobs:
+  build-macos:
+    # macos-14 is the Apple Silicon (arm64) GitHub-hosted runner.
+    runs-on: macos-14
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      startsWith(github.event.head_commit.message, 'release:') ||
+      (startsWith(github.event.head_commit.message, 'Merge') && contains(github.event.head_commit.message, 'release/'))
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # need the release commit (and its parents) for the version
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install libfido2
+        run: brew install libfido2 pkg-config
+
+      - name: Derive version
+        id: version
+        # The release version lives in a `release: X.Y.Z` commit. Scan HEAD and
+        # its parents so this works for both squash and regular merges.
+        run: |
+          VERSION=$(for sha in $(git rev-list --parents -n 1 HEAD); do
+            git log -1 --pretty=%s "$sha"
+          done | sed -n 's/^release: //p' | head -1)
+          if [ -z "$VERSION" ]; then
+            echo "No 'release: X.Y.Z' commit found at HEAD or its parents" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: |
+          mkdir -p dist
+          go build -trimpath \
+            -ldflags "-s -w -X main.version=v${{ steps.version.outputs.version }}" \
+            -o dist/ws-darwin-arm64 ./cmd/ws
+
+      - name: Checksum
+        working-directory: dist
+        run: shasum -a 256 ws-darwin-arm64 > ws-darwin-arm64.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ws-darwin-arm64
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: build-macos
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 'lts/*'
+
+      # just-release detects the release commit, creates the vX.Y.Z release, and
+      # attaches this run's uploaded artifacts (the macOS binary + checksum).
+      - run: npx just-release
+        env:
+          CI: 1
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

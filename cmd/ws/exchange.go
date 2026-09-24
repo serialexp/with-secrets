@@ -560,16 +560,23 @@ func selectItems(title string, items []checklistItem) ([]checklistItem, bool, er
 	return runChecklist(tty, title, items)
 }
 
-// previewSecret reveals just enough of a value to tell two apart (first 3 + last
-// rune), never enough to disclose it.
+// previewSecret renders a value for on-screen checklists: enough to tell two
+// entries apart while eliding the middle of anything long enough to hide. It
+// shows the first three and last three runes with the middle elided. Values of
+// six runes or fewer can't be masked that way (first-3/last-3 would overlap and
+// reveal everything), so they're shown in full — a secret that short is already
+// weak and should be rotated regardless. Newlines become ⏎ so a multi-line value
+// can't break the row or smuggle a real newline into the revealed edges.
 func previewSecret(v string) string {
-	r := []rune(v)
+	r := []rune(strings.ReplaceAll(v, "\n", "⏎"))
 	switch {
 	case len(r) == 0:
 		return "(empty)"
-	case len(r) <= 4:
-		return "(short)"
+	case len(r) <= 6:
+		// 7 is the shortest length that still hides at least one middle rune;
+		// anything shorter reveals in full whether we like it or not.
+		return string(r)
 	default:
-		return string(r[:3]) + "…" + string(r[len(r)-1])
+		return string(r[:3]) + "…" + string(r[len(r)-3:])
 	}
 }

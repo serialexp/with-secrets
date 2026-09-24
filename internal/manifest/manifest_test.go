@@ -143,6 +143,133 @@ func TestCreateAndAddEntry(t *testing.T) {
 	}
 }
 
+func TestParseExtends(t *testing.T) {
+	m, err := Parse(strings.NewReader("# @scope kid\n# @extends ../..\nFOO\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Extends != "../.." {
+		t.Errorf("extends = %q, want ../..", m.Extends)
+	}
+	if m.Scope != "kid" {
+		t.Errorf("scope = %q, want kid", m.Scope)
+	}
+}
+
+func TestParseExtendsErrors(t *testing.T) {
+	cases := map[string]string{
+		"empty ref":       "# @extends\n",
+		"empty ref space": "# @extends   \n",
+		"duplicate":       "# @extends ..\n# @extends ../..\n",
+	}
+	for name, in := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Parse(strings.NewReader(in)); err == nil {
+				t.Errorf("expected error for %q", in)
+			}
+		})
+	}
+}
+
+// writeManifest writes dir/.secrets with the given body, creating dir.
+func writeManifest(t *testing.T, dir, body string) string {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(dir, DefaultName)
+	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestChain(t *testing.T) {
+	root := t.TempDir()
+	// grand (root) <- parent <- child, each extends the dir above it.
+	writeManifest(t, root, "# @scope grand\nG\n")
+	writeManifest(t, filepath.Join(root, "p"), "# @scope parent\n# @extends ..\nP\n")
+	childDir := filepath.Join(root, "p", "c")
+	writeManifest(t, childDir, "# @scope kid\n# @extends ..\nC\n")
+
+	links, err := Chain(childDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(links) != 3 {
+		t.Fatalf("got %d links, want 3: %+v", len(links), links)
+	}
+	wantScopes := []string{"kid", "parent", "grand"}
+	if got := Scopes(links); !equalStrings(got, wantScopes) {
+		t.Errorf("Scopes = %v, want %v", got, wantScopes)
+	}
+
+	// MergedEntries: nearest-first, union.
+	merged := MergedEntries(links)
+	var envs []string
+	for _, e := range merged {
+		envs = append(envs, e.EnvVar)
+	}
+	if !equalStrings(envs, []string{"C", "P", "G"}) {
+		t.Errorf("MergedEntries order = %v, want [C P G]", envs)
+	}
+}
+
+func TestChainNearestWinsOnConflict(t *testing.T) {
+	root := t.TempDir()
+	writeManifest(t, root, "# @scope parent\nSHARED=parent/key\n")
+	childDir := filepath.Join(root, "c")
+	writeManifest(t, childDir, "# @scope kid\n# @extends ..\nSHARED=kid/key\n")
+
+	links, err := Chain(childDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	merged := MergedEntries(links)
+	if len(merged) != 1 {
+		t.Fatalf("want 1 merged entry, got %+v", merged)
+	}
+	if merged[0].StoreKey != "kid/key" {
+		t.Errorf("child should win: got %+v", merged[0])
+	}
+}
+
+func TestChainNoManifest(t *testing.T) {
+	if _, err := Chain(t.TempDir()); !os.IsNotExist(err) {
+		t.Errorf("want ErrNotExist, got %v", err)
+	}
+}
+
+func TestChainMissingParent(t *testing.T) {
+	dir := t.TempDir()
+	writeManifest(t, dir, "# @extends ../nowhere\nFOO\n")
+	if _, err := Chain(dir); err == nil {
+		t.Error("expected error when @extends points at a dir with no .secrets")
+	}
+}
+
+func TestChainCycle(t *testing.T) {
+	root := t.TempDir()
+	// a/.secrets extends b, b/.secrets extends a — a cycle.
+	writeManifest(t, filepath.Join(root, "a"), "# @extends ../b\nA\n")
+	writeManifest(t, filepath.Join(root, "b"), "# @extends ../a\nB\n")
+	if _, err := Chain(filepath.Join(root, "a")); err == nil {
+		t.Error("expected cycle error")
+	}
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func TestInlineCommentStripping(t *testing.T) {
 	m, err := Parse(strings.NewReader("FOO=bar#nospace"))
 	if err != nil {

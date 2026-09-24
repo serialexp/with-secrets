@@ -48,6 +48,10 @@ import (
 	"with-secrets/internal/store"
 )
 
+// version is the build version, overridden at release time via
+// -ldflags "-X main.version=<tag>". It stays "dev" for local builds.
+var version = "dev"
+
 func main() {
 	args := os.Args[1:]
 
@@ -61,6 +65,9 @@ func main() {
 			continue
 		case "-h", "--help", "help":
 			usage(os.Stdout)
+			return
+		case "-v", "--version", "version":
+			fmt.Printf("%s %s\n", progName(), version)
 			return
 		}
 		break
@@ -81,6 +88,8 @@ func main() {
 		err = cmdSet(global, rest)
 	case "rm":
 		err = cmdRm(global, rest)
+	case "get", "show":
+		err = cmdGet(global, rest)
 	case "list", "ls":
 		err = cmdList(global, rest)
 	case "scopes":
@@ -120,10 +129,12 @@ func usage(w io.Writer) {
   %[1]s -g set NAME          store a global secret
   %[1]s rm   NAME            remove a secret from the current scope
   %[1]s -g rm NAME           remove a global secret
+  %[1]s get  NAME            print one secret's value to stdout (touch; alias: show)
   %[1]s list                 list current scope + global names (no touch; alias: ls)
   %[1]s -g list              list global names only (no touch)
   %[1]s scopes               list all scope names (no touch)
-  %[1]s import [DIR]         scan .env files, pick secrets, import + strip them
+  %[1]s import [DIR] [--all] scan .env files, pick secrets, import + strip them
+                            (--all: no dir/template auto-ignores)
   %[1]s request             mint a one-time key to receive secrets from someone
   %[1]s send --to TOKEN [DIR] encrypt this repo's secrets to a recipient token
   %[1]s receive BLOB [DIR]   decrypt a received blob into your own store
@@ -202,6 +213,24 @@ func currentScopeFrom(dir string) (scope, manifestPath string, err error) {
 		s = filepath.Dir(p)
 	}
 	return s, p, nil
+}
+
+// currentScopes returns the working directory's scope chain, nearest-first
+// (following @extends across nested manifests), or nil when there is no manifest.
+// Global is not included; the store applies it as the final fallback.
+func currentScopes() ([]string, error) {
+	wd, err := os.Getwd()
+	if err != nil {
+		return nil, err
+	}
+	links, err := manifest.Chain(wd)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return manifest.Scopes(links), nil
 }
 
 // resolveWriteContext resolves the write context for the working directory.
@@ -284,6 +313,22 @@ func readStore() (h store.Header, idx store.Index, ct, aad []byte, path string, 
 	return h, idx, ct, aad, path, nil
 }
 
+// touchWithRetry runs a YubiKey touch operation. If no authenticator is
+// connected (fido.ErrNoDevice), it invokes reconnect — letting the user plug one
+// in — and retries, instead of failing outright. reconnect returns false to give
+// up, in which case the original fido.ErrNoDevice propagates.
+func touchWithRetry(op func() ([]byte, error), reconnect func() bool) ([]byte, error) {
+	for {
+		out, err := op()
+		if !errors.Is(err, fido.ErrNoDevice) {
+			return out, err
+		}
+		if !reconnect() {
+			return out, err
+		}
+	}
+}
+
 // touchDeriveDecrypt performs the YubiKey touch, folds the result into the given
 // passKey, and decrypts. The caller owns (and must Zero) the returned key.
 func touchDeriveDecrypt(passKey []byte, h store.Header, ct, aad []byte) (*store.Store, []byte, error) {
@@ -292,7 +337,9 @@ func touchDeriveDecrypt(passKey []byte, h store.Header, ct, aad []byte) (*store.
 		return nil, nil, err
 	}
 	fmt.Fprintln(os.Stderr, "Touch your YubiKey…")
-	hmacOut, err := fido.HMACSecret(h.CredID, h.HMACSalt, cdh)
+	hmacOut, err := touchWithRetry(func() ([]byte, error) {
+		return fido.HMACSecret(h.CredID, h.HMACSalt, cdh)
+	}, promptReconnectKey)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -379,7 +426,9 @@ func cmdInit(args []string) error {
 		return err
 	}
 	fmt.Fprintln(os.Stderr, "Enrolling a credential — touch your YubiKey (1/2)…")
-	credID, err := fido.Enroll(cdh)
+	credID, err := touchWithRetry(func() ([]byte, error) {
+		return fido.Enroll(cdh)
+	}, promptReconnectKey)
 	if err != nil {
 		return err
 	}
@@ -394,7 +443,9 @@ func cmdInit(args []string) error {
 		return err
 	}
 	fmt.Fprintln(os.Stderr, "Deriving key — touch your YubiKey (2/2)…")
-	hmacOut, err := fido.HMACSecret(credID, h.HMACSalt, cdh2)
+	hmacOut, err := touchWithRetry(func() ([]byte, error) {
+		return fido.HMACSecret(credID, h.HMACSalt, cdh2)
+	}, promptReconnectKey)
 	if err != nil {
 		return err
 	}
@@ -496,39 +547,122 @@ func cmdRm(global bool, args []string) error {
 	return nil
 }
 
+// parseGetArgs pulls the -f/--force flag out of get's arguments and requires
+// exactly one positional NAME.
+func parseGetArgs(args []string) (name string, force bool, err error) {
+	var positional []string
+	for _, a := range args {
+		switch a {
+		case "-f", "--force":
+			force = true
+		default:
+			positional = append(positional, a)
+		}
+	}
+	if len(positional) != 1 {
+		return "", false, errors.New("usage: with-secrets [-g] get NAME [-f]")
+	}
+	return positional[0], force, nil
+}
+
+// cmdGet decrypts a single secret and writes its raw value to stdout with no
+// trailing newline, so it pipes cleanly (`ws get X | pbcopy`). Like `run`, a
+// scoped lookup falls back to global; `-g` reads global directly. Requires a
+// touch — this is the one command that reveals plaintext. To avoid splattering a
+// secret into terminal scrollback, it refuses to write to a TTY unless -f/--force
+// is given.
+func cmdGet(global bool, args []string) error {
+	name, force, err := parseGetArgs(args)
+	if err != nil {
+		return err
+	}
+
+	if term.IsTerminal(int(os.Stdout.Fd())) && !force {
+		return errors.New("refusing to print a secret to the terminal; pipe it (e.g. `| pbcopy`) or pass -f to force")
+	}
+
+	var scopes []string
+	label := "global"
+	if !global {
+		s, err := currentScopes()
+		if err != nil {
+			return err
+		}
+		scopes = s
+		if len(scopes) > 0 {
+			label = "scope " + scopes[0] + " (or its parents/global)"
+		}
+	}
+
+	st, key, _, _, err := unlock()
+	if err != nil {
+		return err
+	}
+	defer store.Zero(key)
+
+	val, ok := st.ResolveChain(scopes, name)
+	if !ok {
+		return fmt.Errorf("no secret named %q in %s", name, label)
+	}
+	_, err = os.Stdout.WriteString(val)
+	return err
+}
+
 // cmdList prints secret names without decrypting: it reads the cleartext index,
-// so no passphrase or touch is required. Within a scope it shows that scope's
-// names plus the global names that still apply there (a global name shadowed by a
-// scoped one of the same name does not apply and is omitted).
+// so no passphrase or touch is required. Within a scope it walks the @extends
+// chain, showing the nearest scope's names, then each parent scope's names (as
+// inherited), then the global names that still apply — a name shadowed by a
+// nearer scope is omitted, matching what `run`/`get` would resolve.
 func cmdList(global bool, _ []string) error {
 	_, idx, _, _, _, err := readStore()
 	if err != nil {
 		return err
 	}
-	scope := ""
+	var scopes []string
 	if !global {
-		scope, _, err = currentScope()
+		scopes, err = currentScopes()
 		if err != nil {
 			return err
 		}
 	}
-	printNames(scope, idx)
+	printNames(os.Stdout, scopes, idx)
 	return nil
 }
 
-// printNames prints secret names grouped as [scope] then [global]. When scope is
-// empty only global names are shown. Global names shadowed by a same-named scoped
-// secret are omitted (the scoped value wins). Empty groups are skipped, and when
-// nothing matches it says so instead of printing a bare header.
-func printNames(scope string, idx store.Index) {
-	var scopeNames []string
+// printNames prints secret names grouped by the scope chain, then [global],
+// skipping any name shadowed by a nearer scope. scopes is nearest-first (empty =
+// global only). The nearest scope is headed "[scope X]"; parent scopes reached
+// via @extends are headed "[inherited from X]". Empty groups are skipped, and
+// when nothing matches it says so instead of printing a bare header.
+func printNames(w io.Writer, scopes []string, idx store.Index) {
 	shadowed := map[string]bool{}
-	if scope != "" {
-		scopeNames = idx.Scopes[scope]
-		for _, n := range scopeNames {
-			shadowed[n] = true
-		}
+	type group struct {
+		header string
+		names  []string
 	}
+	var groups []group
+	for i, scope := range scopes {
+		if scope == "" {
+			continue
+		}
+		var names []string
+		for _, n := range idx.Scopes[scope] {
+			if shadowed[n] {
+				continue
+			}
+			shadowed[n] = true
+			names = append(names, n)
+		}
+		if len(names) == 0 {
+			continue
+		}
+		header := "[scope " + scope + "]"
+		if i > 0 {
+			header = "[inherited from " + scope + "]"
+		}
+		groups = append(groups, group{header, names})
+	}
+
 	var globalNames []string
 	for _, n := range idx.Global {
 		if !shadowed[n] {
@@ -536,24 +670,24 @@ func printNames(scope string, idx store.Index) {
 		}
 	}
 
-	if len(scopeNames) == 0 && len(globalNames) == 0 {
-		if scope != "" {
-			fmt.Printf("No secrets in scope %q or global.\n", scope)
+	if len(groups) == 0 && len(globalNames) == 0 {
+		if len(scopes) > 0 {
+			fmt.Fprintf(w, "No secrets in scope %q or global.\n", scopes[0])
 		} else {
-			fmt.Println("No global secrets stored.")
+			fmt.Fprintln(w, "No global secrets stored.")
 		}
 		return
 	}
-	if len(scopeNames) > 0 {
-		fmt.Printf("[scope %s]\n", scope)
-		for _, n := range scopeNames {
-			fmt.Println("  " + n)
+	for _, g := range groups {
+		fmt.Fprintln(w, g.header)
+		for _, n := range g.names {
+			fmt.Fprintln(w, "  "+n)
 		}
 	}
 	if len(globalNames) > 0 {
-		fmt.Println("[global]")
+		fmt.Fprintln(w, "[global]")
 		for _, n := range globalNames {
-			fmt.Println("  " + n)
+			fmt.Fprintln(w, "  "+n)
 		}
 	}
 }
@@ -588,24 +722,18 @@ func cmdRun(args []string) error {
 	if err != nil {
 		return err
 	}
-	mpath, err := manifest.FindUp(wd)
+	links, err := manifest.Chain(wd)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("no %s found in %s or any parent directory", manifest.DefaultName, wd)
 		}
 		return err
 	}
-	m, err := manifest.Load(mpath)
-	if err != nil {
-		return err
+	entries := manifest.MergedEntries(links)
+	if len(entries) == 0 {
+		return fmt.Errorf("%s is empty; nothing to inject", links[0].Path)
 	}
-	if len(m.Entries) == 0 {
-		return fmt.Errorf("%s is empty; nothing to inject", mpath)
-	}
-	scope := m.Scope
-	if scope == "" {
-		scope = filepath.Dir(mpath)
-	}
+	scopes := manifest.Scopes(links)
 
 	st, key, _, _, err := unlock()
 	if err != nil {
@@ -616,8 +744,8 @@ func cmdRun(args []string) error {
 	// Resolve all entries before touching the environment.
 	env := os.Environ()
 	var missing []string
-	for _, e := range m.Entries {
-		val, ok := st.Resolve(scope, e.StoreKey)
+	for _, e := range entries {
+		val, ok := st.ResolveChain(scopes, e.StoreKey)
 		if !ok {
 			missing = append(missing, e.StoreKey)
 			continue
@@ -781,11 +909,11 @@ func sessionList(ctx scopeCtx) error {
 	if err != nil {
 		return err
 	}
-	scope := ""
-	if !ctx.global {
-		scope = ctx.scope
+	var scopes []string
+	if !ctx.global && ctx.scope != "" {
+		scopes = []string{ctx.scope}
 	}
-	printNames(scope, idx)
+	printNames(os.Stdout, scopes, idx)
 	return nil
 }
 
@@ -827,6 +955,30 @@ func promptYesNo(prompt string) (bool, error) {
 		return true, nil
 	}
 	return false, nil
+}
+
+// promptReconnectKey asks the user to connect an authenticator after a "no
+// device" error, returning true to retry. With no controlling terminal to ask on
+// (piped/non-interactive), it returns false so the caller fails fast instead of
+// looping forever.
+func promptReconnectKey() bool {
+	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+	if err != nil {
+		return false
+	}
+	defer tty.Close()
+
+	fmt.Fprint(tty, "No YubiKey detected. Plug it in and press Enter to retry, or 'q' to give up: ")
+	line, err := bufio.NewReader(tty).ReadString('\n')
+	if err != nil {
+		// EOF (Ctrl-D) or read error — give up rather than loop.
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "q", "quit", "n", "no":
+		return false
+	}
+	return true
 }
 
 // readSecret prompts on and reads a line from the controlling terminal,
