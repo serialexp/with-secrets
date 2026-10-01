@@ -7,7 +7,7 @@
 //	argonTime    uint32    Argon2id iterations
 //	argonMemory  uint32    Argon2id memory in KiB
 //	argonThreads uint8     Argon2id parallelism
-//	salt         [16]byte  Argon2id salt (fixed for the life of the store)
+//	salt         [16]byte  Argon2id salt (fixed until the passphrase is rotated)
 //	credIDLen    uint16
 //	credID       [credIDLen]byte   FIDO2 non-resident credential id
 //	hmacSalt     [32]byte  salt fed to the YubiKey hmac-secret extension
@@ -30,6 +30,10 @@
 // Everything preceding the ciphertext — header and index — is authenticated as
 // AEAD additional data, so params, credential id, salts, and the name index
 // cannot be altered without failing the next decryption.
+//
+// Rotating the passphrase (Rotate) replaces salt and the Argon2id params and
+// re-seals the payload; credID and hmacSalt are kept, so the same YubiKey touch
+// keeps working and the hmac-secret factor is unchanged.
 package store
 
 import (
@@ -59,6 +63,13 @@ const (
 	nonceLen    = chacha20poly1305.NonceSizeX // 24
 
 	hkdfInfo = "with-secrets/v1/masterkey"
+
+	// Bounds on Argon2id params read from a file. They are used before the AEAD
+	// can reject a tampered header, so out-of-range values must be refused up
+	// front: zero time/threads panic in argon2.IDKey, and huge memory exhausts
+	// RAM. The caps sit far above DefaultParams.
+	maxArgonTime   = 64
+	maxArgonMemory = 4 * 1024 * 1024 // KiB = 4 GiB
 )
 
 var magic = [4]byte{'W', 'S', 'E', 'C'}
@@ -70,6 +81,10 @@ var (
 	ErrTruncated   = errors.New("store: file is truncated or malformed")
 	ErrDecrypt     = errors.New("store: decryption failed (wrong passphrase, wrong key, or tampered file)")
 	ErrCredTooLong = errors.New("store: credential id exceeds 65535 bytes")
+	// ErrEmptyPassphrase is returned when asked to seal under an empty passphrase.
+	ErrEmptyPassphrase = errors.New("store: passphrase must not be empty")
+	// ErrBadParams is returned when a header carries unusable Argon2id params.
+	ErrBadParams = errors.New("store: Argon2id parameters out of range")
 )
 
 // Params holds the Argon2id cost parameters.
@@ -82,6 +97,15 @@ type Params struct {
 // DefaultParams returns sensible Argon2id parameters (~64 MiB, 3 passes).
 func DefaultParams() Params {
 	return Params{Time: 3, Memory: 64 * 1024, Threads: 4}
+}
+
+// valid reports whether p is safe to hand to argon2.IDKey: at least one pass
+// and one thread, at least 8 KiB per thread (Argon2's minimum), and within the
+// time/memory caps.
+func (p Params) valid() bool {
+	return p.Time >= 1 && p.Time <= maxArgonTime &&
+		p.Threads >= 1 &&
+		p.Memory >= 8*uint32(p.Threads) && p.Memory <= maxArgonMemory
 }
 
 // Store is the decrypted secret store: a set of global secrets plus per-scope
@@ -243,9 +267,10 @@ func sortedKeys(m map[string]string) []string {
 	return out
 }
 
-// Header is the non-ciphertext portion of the envelope. Salt, CredID and
-// HMACSalt are fixed for the life of a store so that both factors reproduce the
-// same masterKey; Nonce is regenerated on every Encrypt.
+// Header is the non-ciphertext portion of the envelope. CredID and HMACSalt are
+// fixed for the life of a store; Salt and Params are fixed until the passphrase
+// is rotated. Together they make both factors reproduce the same masterKey.
+// Nonce is regenerated on every Encrypt.
 type Header struct {
 	Params   Params
 	Salt     []byte
@@ -270,6 +295,13 @@ func NewHeader(params Params, credID []byte) (Header, error) {
 		return Header{}, err
 	}
 	return h, nil
+}
+
+// SamePassKDF reports whether a and b stretch a passphrase identically (same
+// Argon2id salt and params), i.e. whether a passKey derived for one also applies
+// to the other. Ordinary writes keep this true; a passphrase rotation breaks it.
+func SamePassKDF(a, b Header) bool {
+	return a.Params == b.Params && bytes.Equal(a.Salt, b.Salt)
 }
 
 // DerivePassKey stretches the passphrase with Argon2id into a 32-byte key. This
@@ -350,6 +382,9 @@ func ParseHeader(data []byte) (h Header, idx Index, ciphertext, aad []byte, err 
 	}
 	if h.Params.Threads, err = r.ReadByte(); err != nil {
 		return Header{}, Index{}, nil, nil, ErrTruncated
+	}
+	if !h.Params.valid() {
+		return Header{}, Index{}, nil, nil, fmt.Errorf("%w: %+v", ErrBadParams, h.Params)
 	}
 
 	h.Salt = make([]byte, saltLen)
@@ -441,13 +476,9 @@ func Encrypt(key []byte, h Header, s *Store) ([]byte, error) {
 
 // Decrypt opens the ciphertext with key and returns the store.
 func Decrypt(key []byte, h Header, ciphertext, aad []byte) (*Store, error) {
-	aead, err := chacha20poly1305.NewX(key)
+	plaintext, err := open(key, h, ciphertext, aad)
 	if err != nil {
 		return nil, err
-	}
-	plaintext, err := aead.Open(nil, h.Nonce, ciphertext, aad)
-	if err != nil {
-		return nil, ErrDecrypt
 	}
 	defer Zero(plaintext)
 
@@ -457,6 +488,108 @@ func Decrypt(key []byte, h Header, ciphertext, aad []byte) (*Store, error) {
 	}
 	s.ensure()
 	return s, nil
+}
+
+// Rotate re-seals the envelope data under a new passphrase and returns the
+// complete new envelope. oldPassKey is DerivePassKey(oldPassphrase, header of
+// data) and hmacOut the hmac-secret output from the touch for that header.
+//
+// Rotate first opens data with those factors, so it can only proceed when they
+// are provably correct — a wrong or zeroed hmacOut is refused rather than
+// sealing a store no YubiKey could ever reopen. The new header keeps the
+// credential id and hmac salt (the same touch keeps working, no second touch
+// needed) but gets a fresh Argon2id salt and the given params. Before
+// returning, the new envelope is parsed back and opened with a key derived
+// afresh from the new passphrase, so an envelope that fails to round-trip is
+// never handed back to be written over the old one.
+func Rotate(data, oldPassKey, hmacOut, newPassphrase []byte, params Params) ([]byte, error) {
+	if len(newPassphrase) == 0 {
+		return nil, ErrEmptyPassphrase
+	}
+	if !params.valid() {
+		return nil, fmt.Errorf("%w: %+v", ErrBadParams, params)
+	}
+
+	h, _, ct, aad, err := ParseHeader(data)
+	if err != nil {
+		return nil, err
+	}
+	oldKey, err := CombineKey(oldPassKey, hmacOut)
+	if err != nil {
+		return nil, err
+	}
+	s, err := Decrypt(oldKey, h, ct, aad)
+	Zero(oldKey)
+	if err != nil {
+		return nil, err
+	}
+
+	nh := Header{
+		Params:   params,
+		Salt:     make([]byte, saltLen),
+		CredID:   bytes.Clone(h.CredID),
+		HMACSalt: bytes.Clone(h.HMACSalt),
+	}
+	if _, err := io.ReadFull(rand.Reader, nh.Salt); err != nil {
+		return nil, err
+	}
+	key, err := DeriveKey(newPassphrase, hmacOut, nh)
+	if err != nil {
+		return nil, err
+	}
+	defer Zero(key)
+	out, err := Encrypt(key, nh, s)
+	if err != nil {
+		return nil, err
+	}
+
+	// Verify: parse what we are about to hand back and open it from scratch.
+	// The raw plaintext is zeroed rather than decoded, so verification leaves
+	// no extra copy of the secrets behind in memory.
+	ph, _, pct, paad, err := ParseHeader(out)
+	if err != nil {
+		return nil, fmt.Errorf("store: rotated envelope does not parse: %w", err)
+	}
+	if !bytes.Equal(ph.CredID, h.CredID) || !bytes.Equal(ph.HMACSalt, h.HMACSalt) {
+		return nil, errors.New("store: rotated envelope lost the YubiKey credential or hmac salt")
+	}
+	vkey, err := DeriveKey(newPassphrase, hmacOut, ph)
+	if err != nil {
+		return nil, err
+	}
+	defer Zero(vkey)
+	plain, err := open(vkey, ph, pct, paad)
+	if err != nil {
+		return nil, fmt.Errorf("store: rotated envelope does not reopen: %w", err)
+	}
+	Zero(plain)
+	return out, nil
+}
+
+// Check reports whether key opens the envelope, without decoding the payload
+// (the plaintext is zeroed immediately). Use it when only the factors need
+// validating, so no unzeroable copy of the secrets is left in memory.
+func Check(key []byte, h Header, ciphertext, aad []byte) error {
+	plaintext, err := open(key, h, ciphertext, aad)
+	if err != nil {
+		return err
+	}
+	Zero(plaintext)
+	return nil
+}
+
+// open authenticates and decrypts the ciphertext, returning the raw plaintext
+// JSON. The caller owns (and must Zero) it.
+func open(key []byte, h Header, ciphertext, aad []byte) ([]byte, error) {
+	aead, err := chacha20poly1305.NewX(key)
+	if err != nil {
+		return nil, err
+	}
+	plaintext, err := aead.Open(nil, h.Nonce, ciphertext, aad)
+	if err != nil {
+		return nil, ErrDecrypt
+	}
+	return plaintext, nil
 }
 
 // Zero overwrites b with zeros. Best-effort defence against secrets lingering

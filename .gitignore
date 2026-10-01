@@ -8,4 +8,5 @@
 
 # Local secret stores and exchange blobs (never commit these)
 *.wsec
+*.wsec.lock
 *.wsx

@@ -46,6 +46,7 @@ committed `.secrets` manifests already show.
 
 ```sh
 ws init                 # create the store (passphrase + 2 touches)
+ws rotate               # change the passphrase (old passphrase + 1 touch)
 ws set  AWS_SECRET      # store a secret in the current project scope
 ws -g set GITHUB_TOKEN  # store a global secret
 ws list                 # list current scope + global names (no touch; alias: ls)
@@ -241,6 +242,47 @@ re-derives from the cached passphrase key plus a fresh touch, so the only thing
 lingering in memory is one of the two factors, useless on its own. The cache
 dies when the process exits; there is no background daemon or socket.
 
+### Changing the passphrase
+
+`ws rotate` changes the store's passphrase — handy when it follows a password
+that expires on a schedule:
+
+```
+$ ws rotate
+Current passphrase: ********************
+Touch your YubiKey…
+New passphrase: ********************
+Confirm passphrase: ********************
+Re-encrypting…
+Passphrase changed. Any open `ws session` must be restarted.
+```
+
+It takes the current passphrase and a single touch. The store gets a fresh
+Argon2id salt (and the current default Argon2id cost, so older stores pick up
+stronger settings) and is re-encrypted under the new master key. The YubiKey
+side is left alone: the same credential and hmac salt keep working, so no second
+touch is needed and nothing changes on the key. Rotation only proceeds once that
+touch and the current passphrase have opened the existing store, and the new
+file is checked to open with the new passphrase before it replaces the old one.
+Choosing the same passphrase again is refused.
+
+Only the live store changes. Copies of the old file — Time Machine, other
+backups — still open with the old passphrase plus your YubiKey.
+
+A `ws session` started before a rotation still holds the old passphrase key; its
+next change fails with a message telling you to start a new session.
+
+### Concurrent commands
+
+Every change is read → decrypt → modify → save. Saving is compare-and-swap: under
+an exclusive lock (`store.wsec.lock`, next to the store) the file must still be
+exactly what the command read, or nothing is written and the command asks you
+to re-run it. So two `ws` commands in different terminals can't silently
+overwrite each other — and a `set` racing a `rotate` can't quietly restore the
+old passphrase. The lock is held only for that check and the atomic rename,
+never while a prompt waits for you, so a forgotten `ws set` in another tab
+blocks nothing.
+
 ### The `.secrets` manifest
 
 A per-project file naming which secrets to inject and which scope they belong to.
@@ -261,6 +303,8 @@ resolving most-specific-first (see [Inheriting a parent scope](#inheriting-a-par
 
 Store location: `$WITH_SECRETS_STORE`, else
 `$XDG_DATA_HOME/with-secrets/store.wsec` (default `~/.local/share/...`), mode 0600.
+A `store.wsec.lock` file beside it coordinates concurrent writers (it holds no
+data and is left in place).
 
 ## Install
 

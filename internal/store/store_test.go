@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"io"
+	"reflect"
 	"testing"
 )
 
@@ -268,7 +269,9 @@ func TestTamperHeaderFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	data[5] ^= 0xFF // first byte of Argon2 Time param
+	// Last byte of the Argon2 Time param: 1 -> 3, still in range, so only the
+	// AEAD (header as additional data) can catch it.
+	data[8] ^= 0x02
 	h2, _, ct, aad, err := ParseHeader(data)
 	if err != nil {
 		t.Fatal(err)
@@ -373,5 +376,261 @@ func TestParseErrors(t *testing.T) {
 	bad := append(append([]byte{}, magic[:]...), 0xFF) // unsupported version
 	if _, _, _, _, err := ParseHeader(bad); !errors.Is(err, ErrBadVersion) {
 		t.Errorf("expected ErrBadVersion, got %v", err)
+	}
+}
+
+// rotateFixture seals a sample store (with a signing identity) under oldPass and
+// returns the envelope, the old passphrase key, the fake hmac-secret output
+// standing in for the touch, and the plaintext store for comparison.
+func rotateFixture(t *testing.T, oldPass string) (data, oldPassKey, hmacOut []byte, want *Store) {
+	t.Helper()
+	h, key, hmacOut := testHeader(t, oldPass)
+	want = sampleStore()
+	if _, err := want.EnsureIdentity(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := Encrypt(key, h, want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data, DerivePassKey([]byte(oldPass), h), hmacOut, want
+}
+
+// openWith parses an envelope and decrypts it with the given passphrase and
+// hmac-secret output.
+func openWith(t *testing.T, data []byte, pass string, hmacOut []byte) (*Store, error) {
+	t.Helper()
+	h, _, ct, aad, err := ParseHeader(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := DeriveKey([]byte(pass), hmacOut, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return Decrypt(key, h, ct, aad)
+}
+
+var rotateParams = Params{Time: 1, Memory: 8 * 1024, Threads: 1}
+
+func TestRotateNewPassphraseOpensWithSameContents(t *testing.T) {
+	data, oldPassKey, hmacOut, want := rotateFixture(t, "old passphrase")
+
+	rotated, err := Rotate(data, oldPassKey, hmacOut, []byte("new passphrase"), rotateParams)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := openWith(t, rotated, "new passphrase", hmacOut)
+	if err != nil {
+		t.Fatalf("new passphrase should open the rotated store: %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("contents changed across rotation:\n got  %+v\n want %+v", got, want)
+	}
+
+	_, oldIdx, _, _, err := ParseHeader(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, newIdx, _, _, err := ParseHeader(rotated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(oldIdx, newIdx) {
+		t.Errorf("name index changed: %+v -> %+v", oldIdx, newIdx)
+	}
+}
+
+func TestRotateOldPassphraseNoLongerOpens(t *testing.T) {
+	data, oldPassKey, hmacOut, _ := rotateFixture(t, "old passphrase")
+	rotated, err := Rotate(data, oldPassKey, hmacOut, []byte("new passphrase"), rotateParams)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := openWith(t, rotated, "old passphrase", hmacOut); !errors.Is(err, ErrDecrypt) {
+		t.Fatalf("old passphrase: got %v, want ErrDecrypt", err)
+	}
+}
+
+func TestRotateStillNeedsTheYubiKey(t *testing.T) {
+	data, oldPassKey, hmacOut, _ := rotateFixture(t, "old passphrase")
+	rotated, err := Rotate(data, oldPassKey, hmacOut, []byte("new passphrase"), rotateParams)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := bytes.Clone(hmacOut)
+	other[0] ^= 0xFF
+	if _, err := openWith(t, rotated, "new passphrase", other); !errors.Is(err, ErrDecrypt) {
+		t.Fatalf("new passphrase with wrong hmac output: got %v, want ErrDecrypt", err)
+	}
+}
+
+// Rotate must prove the factors it was handed open the current envelope before
+// sealing a new one: a wrong (or zeroed) hmac output would otherwise produce a
+// store no YubiKey can ever open again.
+func TestRotateRefusesFactorsThatDoNotOpenTheOldStore(t *testing.T) {
+	data, oldPassKey, hmacOut, _ := rotateFixture(t, "old passphrase")
+
+	wrongHMAC := make([]byte, len(hmacOut)) // e.g. zeroed by a refactor
+	if _, err := Rotate(data, oldPassKey, wrongHMAC, []byte("new passphrase"), rotateParams); !errors.Is(err, ErrDecrypt) {
+		t.Errorf("wrong hmac output: got %v, want ErrDecrypt", err)
+	}
+
+	wrongPassKey := bytes.Clone(oldPassKey)
+	wrongPassKey[0] ^= 0xFF
+	if _, err := Rotate(data, wrongPassKey, hmacOut, []byte("new passphrase"), rotateParams); !errors.Is(err, ErrDecrypt) {
+		t.Errorf("wrong passphrase key: got %v, want ErrDecrypt", err)
+	}
+}
+
+func TestRotateKeepsHardwareFactorAndRefreshesSalt(t *testing.T) {
+	data, oldPassKey, hmacOut, _ := rotateFixture(t, "old passphrase")
+	oh, _, _, _, err := ParseHeader(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	params := Params{Time: 2, Memory: 16 * 1024, Threads: 2}
+
+	rotated, err := Rotate(data, oldPassKey, hmacOut, []byte("new passphrase"), params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nh, _, _, _, err := ParseHeader(rotated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(nh.CredID, oh.CredID) {
+		t.Error("credential id changed; the same YubiKey credential must keep working")
+	}
+	if !bytes.Equal(nh.HMACSalt, oh.HMACSalt) {
+		t.Error("hmac salt changed; a password rotation must not change the touch")
+	}
+	if bytes.Equal(nh.Salt, oh.Salt) {
+		t.Error("Argon2id salt was reused; rotation must pick a fresh one")
+	}
+	if bytes.Equal(nh.Nonce, oh.Nonce) {
+		t.Error("nonce was reused")
+	}
+	if nh.Params != params {
+		t.Errorf("params = %+v, want %+v", nh.Params, params)
+	}
+}
+
+func TestRotateDoesNotMutateInput(t *testing.T) {
+	data, oldPassKey, hmacOut, _ := rotateFixture(t, "old passphrase")
+	orig := bytes.Clone(data)
+	if _, err := Rotate(data, oldPassKey, hmacOut, []byte("new passphrase"), rotateParams); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(data, orig) {
+		t.Error("Rotate mutated the old envelope")
+	}
+}
+
+func TestRotateRejectsEmptyPassphrase(t *testing.T) {
+	data, oldPassKey, hmacOut, _ := rotateFixture(t, "old passphrase")
+	if _, err := Rotate(data, oldPassKey, hmacOut, nil, rotateParams); !errors.Is(err, ErrEmptyPassphrase) {
+		t.Fatalf("got %v, want ErrEmptyPassphrase", err)
+	}
+}
+
+func TestSamePassKDF(t *testing.T) {
+	data, oldPassKey, hmacOut, _ := rotateFixture(t, "old passphrase")
+	h, _, _, _, err := ParseHeader(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A normal write only changes the nonce: the cached passKey still applies.
+	same := h
+	same.Nonce = make([]byte, len(h.Nonce))
+	if !SamePassKDF(h, same) {
+		t.Error("headers differing only by nonce should share a passphrase KDF")
+	}
+
+	rotated, err := Rotate(data, oldPassKey, hmacOut, []byte("new passphrase"), h.Params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rh, _, _, _, err := ParseHeader(rotated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if SamePassKDF(h, rh) {
+		t.Error("a rotated header must not share the old passphrase KDF")
+	}
+
+	stronger := h
+	stronger.Params.Time++
+	if SamePassKDF(h, stronger) {
+		t.Error("different Argon2id params must not count as the same KDF")
+	}
+}
+
+// Argon2id params come from the file and are used before the AEAD can reject a
+// tampered header, so ParseHeader must refuse values that would panic or
+// exhaust memory in argon2.IDKey.
+func TestParseHeaderRejectsBadParams(t *testing.T) {
+	cases := []struct {
+		name   string
+		params Params
+	}{
+		{"zero time", Params{Time: 0, Memory: 64 * 1024, Threads: 4}},
+		{"zero threads", Params{Time: 3, Memory: 64 * 1024, Threads: 0}},
+		{"memory below 8 KiB per thread", Params{Time: 3, Memory: 8*4 - 1, Threads: 4}},
+		{"memory above cap", Params{Time: 3, Memory: maxArgonMemory + 1, Threads: 4}},
+		{"time above cap", Params{Time: maxArgonTime + 1, Memory: 64 * 1024, Threads: 4}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			h, err := NewHeader(c.params, []byte("cred"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			data, err := Encrypt(bytes.Repeat([]byte{1}, 32), h, NewStore())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, _, _, _, err := ParseHeader(data); !errors.Is(err, ErrBadParams) {
+				t.Fatalf("got %v, want ErrBadParams", err)
+			}
+		})
+	}
+
+	// The defaults, and the cheap params the tests use, stay valid.
+	for _, p := range []Params{DefaultParams(), rotateParams} {
+		h, err := NewHeader(p, []byte("cred"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := Encrypt(bytes.Repeat([]byte{1}, 32), h, NewStore())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, _, _, _, err := ParseHeader(data); err != nil {
+			t.Errorf("params %+v rejected: %v", p, err)
+		}
+	}
+}
+
+func TestCheck(t *testing.T) {
+	h, key, hmacOut := testHeader(t, "pw")
+	data, err := Encrypt(key, h, sampleStore())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ph, _, ct, aad, err := ParseHeader(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Check(key, ph, ct, aad); err != nil {
+		t.Errorf("right key: %v", err)
+	}
+	wrong, err := DeriveKey([]byte("not pw"), hmacOut, ph)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Check(wrong, ph, ct, aad); !errors.Is(err, ErrDecrypt) {
+		t.Errorf("wrong key: got %v, want ErrDecrypt", err)
 	}
 }

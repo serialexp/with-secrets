@@ -215,7 +215,7 @@ func cmdSend(args []string) error {
 		scope = filepath.Dir(mpath)
 	}
 
-	st, key, h, spath, err := unlock()
+	st, key, f, err := unlock()
 	if err != nil {
 		return err
 	}
@@ -228,7 +228,7 @@ func cmdSend(args []string) error {
 		return err
 	}
 	if created {
-		if err := reseal(key, h, st, spath); err != nil {
+		if err := f.save(key, st); err != nil {
 			return err
 		}
 	}
@@ -431,7 +431,7 @@ func cmdReceive(args []string) error {
 		return err
 	}
 
-	st, key, h, path, err := unlock()
+	st, key, f, err := unlock()
 	if err != nil {
 		return err
 	}
@@ -486,7 +486,7 @@ func cmdReceive(args []string) error {
 	for _, s := range toApply {
 		st.Set(targetScope(ctx, s.Origin), s.Name, s.Value)
 	}
-	if err := reseal(key, h, st, path); err != nil {
+	if err := f.save(key, st); err != nil {
 		return err
 	}
 	// Secrets are committed — destroy the one-time key immediately, so a failure

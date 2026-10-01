@@ -23,11 +23,25 @@ between operations (a session caches only `passKey`, still requiring a touch per
 change). Preserve this: don't add caching of the master key or plaintext, and
 don't add a code path that decrypts values with only one factor.
 
+`ws rotate` changes the passphrase: fresh Argon2id `salt` + current default
+params, same `credID`/`hmacSalt` (so one touch both opens the old envelope and
+seals the new one). `store.Rotate` takes the old envelope and first opens it
+with the given factors (so a wrong hmac output can't seal an unopenable store),
+then verifies the new envelope reopens before returning it. `ParseHeader`
+range-checks Argon2id params, since they're used before the AEAD can reject a
+tampered header.
+
 ## Layout
 
 - `cmd/ws/` — CLI entry point and all command handlers (`main.go` is large: flag
   parsing, `init`/`set`/`rm`/`list`/`scopes`/`run`/`session`, TTY prompts, atomic
-  writes). Subcommands split into `import.go`, `exchange.go`, `checklist.go`.
+  writes). Subcommands split into `import.go`, `exchange.go`, `checklist.go`,
+  `rotate.go`. `storefile.go` owns reading, unlocking and saving the store:
+  **always save through `storeFile.save` / `commitStore`**, never
+  `writeFileAtomic` on the store directly. Saving is compare-and-swap under a
+  `store.wsec.lock` flock — the file must still match the bytes the command
+  read — so concurrent writers (or a write racing `rotate`) can't clobber each
+  other. The lock is held only around the compare + rename, never across prompts.
 - `internal/store/` — on-disk encrypted envelope (`WSEC`). Header + cleartext
   name index are AEAD additional data, so tampering fails decryption. Header has
   a `version` byte for future formats. Only **values** are encrypted; scope and

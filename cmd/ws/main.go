@@ -9,6 +9,7 @@
 // Usage:
 //
 //	ws init                 create the store (passphrase + 2 touches)
+//	ws rotate               change the passphrase (old passphrase + 1 touch)
 //	ws set  NAME            store a secret in the current scope
 //	ws -g set NAME          store a global secret
 //	ws rm   NAME            remove a secret from the current scope
@@ -84,6 +85,8 @@ func main() {
 	switch cmd {
 	case "init":
 		err = cmdInit(rest)
+	case "rotate":
+		err = cmdRotate(rest)
 	case "set":
 		err = cmdSet(global, rest)
 	case "rm":
@@ -125,6 +128,7 @@ func usage(w io.Writer) {
 	fmt.Fprintf(w, `with-secrets — local secrets behind a passphrase + YubiKey touch
 
   %[1]s init                 create the store
+  %[1]s rotate               change the store passphrase (one touch)
   %[1]s set  NAME            store a secret in the current project scope
   %[1]s -g set NAME          store a global secret
   %[1]s rm   NAME            remove a secret from the current scope
@@ -292,27 +296,6 @@ func randCDH() ([]byte, error) {
 	return b, err
 }
 
-// readStore loads and parses the store file, returning the header, the cleartext
-// name index, the ciphertext, the AEAD additional data, and the path.
-func readStore() (h store.Header, idx store.Index, ct, aad []byte, path string, err error) {
-	path, err = storePath()
-	if err != nil {
-		return store.Header{}, store.Index{}, nil, nil, "", err
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return store.Header{}, store.Index{}, nil, nil, "", fmt.Errorf("no store found at %s — run `with-secrets init` first", path)
-		}
-		return store.Header{}, store.Index{}, nil, nil, "", err
-	}
-	h, idx, ct, aad, err = store.ParseHeader(data)
-	if err != nil {
-		return store.Header{}, store.Index{}, nil, nil, "", err
-	}
-	return h, idx, ct, aad, path, nil
-}
-
 // touchWithRetry runs a YubiKey touch operation. If no authenticator is
 // connected (fido.ErrNoDevice), it invokes reconnect — letting the user plug one
 // in — and retries, instead of failing outright. reconnect returns false to give
@@ -329,65 +312,6 @@ func touchWithRetry(op func() ([]byte, error), reconnect func() bool) ([]byte, e
 	}
 }
 
-// touchDeriveDecrypt performs the YubiKey touch, folds the result into the given
-// passKey, and decrypts. The caller owns (and must Zero) the returned key.
-func touchDeriveDecrypt(passKey []byte, h store.Header, ct, aad []byte) (*store.Store, []byte, error) {
-	cdh, err := randCDH()
-	if err != nil {
-		return nil, nil, err
-	}
-	fmt.Fprintln(os.Stderr, "Touch your YubiKey…")
-	hmacOut, err := touchWithRetry(func() ([]byte, error) {
-		return fido.HMACSecret(h.CredID, h.HMACSalt, cdh)
-	}, promptReconnectKey)
-	if err != nil {
-		return nil, nil, err
-	}
-	defer store.Zero(hmacOut)
-
-	key, err := store.CombineKey(passKey, hmacOut)
-	if err != nil {
-		return nil, nil, err
-	}
-	st, err := store.Decrypt(key, h, ct, aad)
-	if err != nil {
-		store.Zero(key)
-		return nil, nil, err
-	}
-	return st, key, nil
-}
-
-// unlock reads the store, prompts for the passphrase, performs the YubiKey
-// touch, and returns the decrypted store plus everything needed to re-seal.
-func unlock() (st *store.Store, key []byte, h store.Header, path string, err error) {
-	h, _, ct, aad, path, err := readStore()
-	if err != nil {
-		return nil, nil, store.Header{}, "", err
-	}
-	pass, err := readSecret("Passphrase: ")
-	if err != nil {
-		return nil, nil, store.Header{}, "", err
-	}
-	passKey := store.DerivePassKey(pass, h)
-	store.Zero(pass)
-	defer store.Zero(passKey)
-
-	st, key, err = touchDeriveDecrypt(passKey, h, ct, aad)
-	if err != nil {
-		return nil, nil, store.Header{}, "", err
-	}
-	return st, key, h, path, nil
-}
-
-// reseal re-encrypts the store under the existing header/key and writes atomically.
-func reseal(key []byte, h store.Header, st *store.Store, path string) error {
-	data, err := store.Encrypt(key, h, st)
-	if err != nil {
-		return err
-	}
-	return writeFileAtomic(path, data, 0o600)
-}
-
 // --- commands -------------------------------------------------------------
 
 func cmdInit(args []string) error {
@@ -401,25 +325,11 @@ func cmdInit(args []string) error {
 		return err
 	}
 
-	pass, err := readSecret("New passphrase: ")
+	pass, err := promptNewPassphrase()
 	if err != nil {
 		return err
 	}
 	defer store.Zero(pass)
-	if len(pass) == 0 {
-		return errors.New("passphrase must not be empty")
-	}
-	confirm, err := readSecret("Confirm passphrase: ")
-	if err != nil {
-		return err
-	}
-	defer store.Zero(confirm)
-	if string(pass) != string(confirm) {
-		return errors.New("passphrases do not match")
-	}
-	if len(pass) < 12 {
-		fmt.Fprintln(os.Stderr, "warning: short passphrase; the on-disk store is only as strong as this.")
-	}
 
 	cdh, err := randCDH()
 	if err != nil {
@@ -464,7 +374,12 @@ func cmdInit(args []string) error {
 	if _, err := st.EnsureIdentity(); err != nil {
 		return err
 	}
-	if err := reseal(key, h, st, path); err != nil {
+	data, err := store.Encrypt(key, h, st)
+	if err != nil {
+		return err
+	}
+	// nil expected: refuse if another init created the store meanwhile.
+	if err := commitStore(path, nil, data); err != nil {
 		return err
 	}
 	fmt.Printf("Created empty store at %s\n", path)
@@ -486,7 +401,7 @@ func cmdSet(global bool, args []string) error {
 		return err
 	}
 
-	st, key, h, path, err := unlock()
+	st, key, f, err := unlock()
 	if err != nil {
 		return err
 	}
@@ -499,7 +414,7 @@ func cmdSet(global bool, args []string) error {
 	defer store.Zero(value)
 
 	st.Set(ctx.scope, name, string(value))
-	if err := reseal(key, h, st, path); err != nil {
+	if err := f.save(key, st); err != nil {
 		return err
 	}
 	if !ctx.global {
@@ -531,7 +446,7 @@ func cmdRm(global bool, args []string) error {
 		label = "scope " + s
 	}
 
-	st, key, h, path, err := unlock()
+	st, key, f, err := unlock()
 	if err != nil {
 		return err
 	}
@@ -540,7 +455,7 @@ func cmdRm(global bool, args []string) error {
 	if !st.Remove(scope, name) {
 		return fmt.Errorf("no secret named %q in %s", name, label)
 	}
-	if err := reseal(key, h, st, path); err != nil {
+	if err := f.save(key, st); err != nil {
 		return err
 	}
 	fmt.Printf("Removed %s (%s)\n", name, label)
@@ -594,7 +509,7 @@ func cmdGet(global bool, args []string) error {
 		}
 	}
 
-	st, key, _, _, err := unlock()
+	st, key, _, err := unlock()
 	if err != nil {
 		return err
 	}
@@ -614,10 +529,11 @@ func cmdGet(global bool, args []string) error {
 // inherited), then the global names that still apply — a name shadowed by a
 // nearer scope is omitted, matching what `run`/`get` would resolve.
 func cmdList(global bool, _ []string) error {
-	_, idx, _, _, _, err := readStore()
+	f, err := readStore()
 	if err != nil {
 		return err
 	}
+	idx := f.idx
 	var scopes []string
 	if !global {
 		scopes, err = currentScopes()
@@ -694,10 +610,11 @@ func printNames(w io.Writer, scopes []string, idx store.Index) {
 
 // cmdScopes lists all scope names in the store (cleartext index; no decryption).
 func cmdScopes(_ []string) error {
-	_, idx, _, _, _, err := readStore()
+	f, err := readStore()
 	if err != nil {
 		return err
 	}
+	idx := f.idx
 	names := idx.ScopeNames()
 	if len(names) == 0 {
 		fmt.Fprintln(os.Stderr, "no scopes yet")
@@ -735,7 +652,7 @@ func cmdRun(args []string) error {
 	}
 	scopes := manifest.Scopes(links)
 
-	st, key, _, _, err := unlock()
+	st, key, _, err := unlock()
 	if err != nil {
 		return err
 	}
@@ -774,7 +691,7 @@ func cmdSession(global bool, _ []string) error {
 		return err
 	}
 
-	h, _, ct, aad, _, err := readStore()
+	f, err := readStore()
 	if err != nil {
 		return err
 	}
@@ -783,18 +700,16 @@ func cmdSession(global bool, _ []string) error {
 	if err != nil {
 		return err
 	}
-	passKey := store.DerivePassKey(pass, h)
+	sk := sessionKey{passKey: store.DerivePassKey(pass, f.h), kdf: f.h}
 	store.Zero(pass)
-	defer store.Zero(passKey)
+	defer store.Zero(sk.passKey)
 
 	// Validate the passphrase up front (one touch) so a typo is caught before
 	// you start entering values.
 	fmt.Fprintln(os.Stderr, "Unlocking…")
-	_, key, err := touchDeriveDecrypt(passKey, h, ct, aad)
-	if err != nil {
+	if err := sk.verify(f); err != nil {
 		return err
 	}
-	store.Zero(key)
 
 	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
 	if err != nil {
@@ -833,13 +748,13 @@ func cmdSession(global bool, _ []string) error {
 				fmt.Fprintln(tty, "usage: set NAME")
 				continue
 			}
-			cerr = sessionSet(passKey, ctx, fields[1])
+			cerr = sessionSet(sk, ctx, fields[1])
 		case "rm":
 			if len(fields) != 2 {
 				fmt.Fprintln(tty, "usage: rm NAME")
 				continue
 			}
-			cerr = sessionRm(passKey, ctx, fields[1])
+			cerr = sessionRm(sk, ctx, fields[1])
 		default:
 			fmt.Fprintf(tty, "unknown command %q (try: help)\n", fields[0])
 		}
@@ -849,7 +764,7 @@ func cmdSession(global bool, _ []string) error {
 	}
 }
 
-func sessionSet(passKey []byte, ctx scopeCtx, name string) error {
+func sessionSet(sk sessionKey, ctx scopeCtx, name string) error {
 	if !manifest.ValidEnvName(name) {
 		return fmt.Errorf("invalid secret name %q", name)
 	}
@@ -859,18 +774,18 @@ func sessionSet(passKey []byte, ctx scopeCtx, name string) error {
 	}
 	defer store.Zero(value)
 
-	h, _, ct, aad, path, err := readStore()
+	f, err := readStore()
 	if err != nil {
 		return err
 	}
-	st, key, err := touchDeriveDecrypt(passKey, h, ct, aad)
+	st, key, err := sk.open(f)
 	if err != nil {
 		return err
 	}
 	defer store.Zero(key)
 
 	st.Set(ctx.scope, name, string(value))
-	if err := reseal(key, h, st, path); err != nil {
+	if err := f.save(key, st); err != nil {
 		return err
 	}
 	if !ctx.global {
@@ -882,12 +797,12 @@ func sessionSet(passKey []byte, ctx scopeCtx, name string) error {
 	return nil
 }
 
-func sessionRm(passKey []byte, ctx scopeCtx, name string) error {
-	h, _, ct, aad, path, err := readStore()
+func sessionRm(sk sessionKey, ctx scopeCtx, name string) error {
+	f, err := readStore()
 	if err != nil {
 		return err
 	}
-	st, key, err := touchDeriveDecrypt(passKey, h, ct, aad)
+	st, key, err := sk.open(f)
 	if err != nil {
 		return err
 	}
@@ -896,7 +811,7 @@ func sessionRm(passKey []byte, ctx scopeCtx, name string) error {
 	if !st.Remove(ctx.scope, name) {
 		return fmt.Errorf("no secret named %q in %s", name, ctx.label())
 	}
-	if err := reseal(key, h, st, path); err != nil {
+	if err := f.save(key, st); err != nil {
 		return err
 	}
 	fmt.Printf("Removed %s (%s)\n", name, ctx.label())
@@ -905,10 +820,11 @@ func sessionRm(passKey []byte, ctx scopeCtx, name string) error {
 
 // sessionList reads the cleartext index — no touch needed to list names.
 func sessionList(ctx scopeCtx) error {
-	_, idx, _, _, _, err := readStore()
+	f, err := readStore()
 	if err != nil {
 		return err
 	}
+	idx := f.idx
 	var scopes []string
 	if !ctx.global && ctx.scope != "" {
 		scopes = []string{ctx.scope}
@@ -1116,5 +1032,23 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmpName, path)
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	// Persist the rename itself: without syncing the directory, a crash right
+	// after could bring back the old file (e.g. undo a passphrase rotation).
+	if err := syncDir(dir); err != nil {
+		return fmt.Errorf("%s was replaced but the directory sync failed: %w", path, err)
+	}
+	return nil
+}
+
+// syncDir flushes a directory's entries to stable storage.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }

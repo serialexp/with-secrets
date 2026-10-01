@@ -174,7 +174,7 @@ func cmdImport(global bool, args []string) error {
 		return err
 	}
 
-	st, key, h, path, err := unlock()
+	st, key, f, err := unlock()
 	if err != nil {
 		return err
 	}
@@ -188,7 +188,7 @@ func cmdImport(global bool, args []string) error {
 	for _, k := range names {
 		st.Set(ctx.scope, k, values[k])
 	}
-	if err := reseal(key, h, st, path); err != nil {
+	if err := f.save(key, st); err != nil {
 		return err
 	}
 	// Best-effort scrub of plaintext we copied around.
